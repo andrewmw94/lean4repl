@@ -73,6 +73,11 @@ structure State where
   -/
   proofStates : Array ProofSnapshot := #[]
 
+  /--
+  To track duplicate states, we store the start and end positions of tactics.
+  -/
+  proofStatePositions : Array (Option (Position × Position)) := #[]
+
 /--
 The Lean REPL monad.
 
@@ -89,12 +94,22 @@ def recordCommandSnapshot (state : CommandSnapshot) : M m Nat := do
   return id
 
 /-- Record a `ProofSnapshot` into the REPL state, returning its index for future use. -/
-def recordProofSnapshot (proofState : ProofSnapshot) : M m Nat := do
-  let id := (← get).proofStates.size
-  modify fun s => { s with proofStates := s.proofStates.push proofState }
-  return id
+def recordProofSnapshot (positions: Option (Position × Position)) (proofState : ProofSnapshot) : M m Nat := do
+  match positions with
+  | some pos =>
+    match ((← get).proofStatePositions).findIdx? (· == pos) with
+    | some id => dbg_trace s!"duplicate state: {pos}"; return id
+    | none => do
+      let id := (← get).proofStates.size
+      modify fun s => { s with proofStates := s.proofStates.push proofState, proofStatePositions := s.proofStatePositions.push (some pos) }
+      return id
+  | none => do
+      let id := (← get).proofStates.size
+      modify fun s => { s with proofStates := s.proofStates.push proofState, proofStatePositions := s.proofStatePositions.push none }
+      return id
 
-def sorries (trees : List InfoTree) (env? : Option Environment) : M m (List Sorry) :=
+
+def sorry_helper (trees : List InfoTree) (env? : Option Environment) : M m (List (Option Sorry)) :=
   trees.bind InfoTree.sorries |>.mapM
     fun ⟨ctx, g, pos, endPos⟩ => do
       let (goal, proofState) ← match g with
@@ -105,8 +120,15 @@ def sorries (trees : List InfoTree) (env? : Option Environment) : M m (List Sorr
          let s ← ProofSnapshot.create ctx lctx env? [] [t]
          pure ("\n".intercalate <| (← s.ppGoals).map fun s => s!"{s}", some s)
       | .term _ none => unreachable!
-      let proofStateId ← proofState.mapM recordProofSnapshot
-      return Sorry.of goal pos endPos proofStateId
+      match ((← get).proofStatePositions).findIdx? (· == (pos, endPos)) with
+        | some _ => return none
+        | none => do
+          let proofStateId ← proofState.mapM (recordProofSnapshot (some (pos, endPos)))
+          return some (Sorry.of goal pos endPos proofStateId)
+
+def sorries (trees : List InfoTree) (env? : Option Environment) : M m (List Sorry) :=
+  sorry_helper trees env? <&> List.filterMap id
+
 
 def ppTactic (ctx : ContextInfo) (stx : Syntax) : IO Format :=
   ctx.runMetaM {} try
@@ -114,14 +136,20 @@ def ppTactic (ctx : ContextInfo) (stx : Syntax) : IO Format :=
   catch _ =>
     pure "<failed to pretty print>"
 
-def tactics (trees : List InfoTree) : M m (List Tactic) :=
+def tactic_helper (trees : List InfoTree) : M m (List (Option Tactic)) :=
   trees.bind InfoTree.tactics |>.mapM
     fun ⟨ctx, stx, goals, pos, endPos⟩ => do
       let proofState := some (← ProofSnapshot.create ctx none none goals)
       let goals := s!"{(← ctx.ppGoals goals)}".trim
       let tactic := Format.pretty (← ppTactic ctx stx)
-      let proofStateId ← proofState.mapM recordProofSnapshot
-      return Tactic.of goals tactic pos endPos proofStateId
+      match ((← get).proofStatePositions).findIdx? (· == (pos, endPos)) with
+        | some _ => return none
+        | none => do
+          let proofStateId ← proofState.mapM (recordProofSnapshot (some (pos, endPos)))
+          return some (Tactic.of goals tactic pos endPos proofStateId)
+
+def tactics (trees : List InfoTree) : M m (List Tactic) :=
+  tactic_helper trees <&> List.filterMap id
 
 /-- Record a `ProofSnapshot` and generate a JSON response for it. -/
 def createProofStepReponse (proofState : ProofSnapshot) (old? : Option ProofSnapshot := none) :
@@ -139,7 +167,7 @@ def createProofStepReponse (proofState : ProofSnapshot) (old? : Option ProofSnap
   -- For debugging purposes, sometimes we print out the trees here:
   -- trees.forM fun t => do IO.println (← t.format)
   let sorries ← sorries trees none
-  let id ← recordProofSnapshot proofState
+  let id ← recordProofSnapshot none proofState
   return {
     proofState := id
     goals := (← proofState.ppGoals).map fun s => s!"{s}"
@@ -228,7 +256,7 @@ def runCommand (s : Command) : M IO (CommandResponse ⊕ Error) := do
     { env,
       messages,
       sorries,
-      tactics
+      tactics,
       infotree }
 
 def processFile (s : File) : M IO (CommandResponse ⊕ Error) := do
